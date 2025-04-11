@@ -4,6 +4,7 @@ A command-line utility for logging messages, counting log entries, and managing 
 
 ## Features
 
+- TCP server with process-based concurrency
 - Continuous logging with timestamps
 - Log file rotation
 - File locking for concurrent access
@@ -15,16 +16,20 @@ A command-line utility for logging messages, counting log entries, and managing 
 
 The program provides four commands:
 
-1. `run` - Start the logging server (writes a log entry every second and manages child processes)
+1. `run` - Start the web server (listens for TCP connections)
 2. `count` - Count the number of log entries
 3. `rotate` - Rotate log files (renames http.log to http.1.log, etc.)
 4. `update-config` - Update server configuration while running
 
 ### Examples
 
-To start the logging server:
+To start the web server:
 ```bash
+# Start server on default port (8080)
 cargo run -- run
+
+# Start server on specific port
+cargo run -- run --port 3000
 ```
 
 To count log entries:
@@ -48,6 +53,23 @@ cargo run -- update-config --max-connections 200
 # Update timeout
 cargo run -- update-config --timeout 60
 ```
+
+## TCP Protocol
+
+The server implements a simple text-based protocol:
+
+1. Connect to the server using netcat:
+```bash
+# On macOS/Linux
+nc localhost 8080
+
+# On Windows (if you have netcat installed)
+nc.exe localhost 8080
+```
+
+2. Send commands:
+- `hello server` - Server responds with `hello client`
+- Any other command - Server responds with `unknown command`
 
 ## Log Format
 
@@ -74,10 +96,9 @@ When rotating logs:
 ## Process Management
 
 When running the server:
-- Forks 4 child processes
-- Each child process runs for a different duration (5, 10, 15, and 20 seconds)
-- Parent process continues logging while monitoring child processes
-- Server exits automatically when all child processes complete
+- Forks 4 child processes for background tasks
+- Forks a new process for each incoming TCP connection
+- Parent process monitors all child processes
 - Child process status is reported as they complete
 
 ## Configuration Management

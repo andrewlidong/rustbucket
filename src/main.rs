@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions, rename, remove_file};
-use std::io::{self, Write, BufRead, BufReader};
+use std::io::{self, Write, BufRead, BufReader, Read};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -12,11 +12,14 @@ use std::process::Command;
 use memmap2::{MmapMut, MmapOptions};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::net::{TcpListener, TcpStream};
+use std::str;
 
 const LOG_FILE: &str = "http.log";
 const MAX_LOG_FILES: u32 = 5;
 const NUM_CHILDREN: usize = 4;
 const CONFIG_FILE: &str = "config.dat";
+const DEFAULT_PORT: u16 = 8080;
 
 #[derive(Debug, Clone, Copy)]
 struct Config {
@@ -64,8 +67,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the logging server
-    Run,
+    /// Start the web server
+    Run {
+        /// Port to listen on
+        #[arg(short, long, default_value_t = DEFAULT_PORT)]
+        port: u16,
+    },
     /// Count the number of log entries
     Count,
     /// Rotate log files
@@ -142,6 +149,28 @@ fn update_config(config: &mut Config, verbosity: Option<u32>, max_connections: O
     config.version += 1;
 }
 
+fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
+    let mut buffer = [0; 1024];
+    let bytes_read = stream.read(&mut buffer)?;
+    
+    if bytes_read == 0 {
+        return Ok(());
+    }
+
+    let request = str::from_utf8(&buffer[..bytes_read]).unwrap_or("Invalid UTF-8");
+    println!("Received request: {}", request);
+
+    // Simple protocol: if client sends "hello server\n", respond with "hello client\n"
+    let response = if request.trim() == "hello server" {
+        "hello client\n"
+    } else {
+        "unknown command\n"
+    };
+
+    stream.write_all(response.as_bytes())?;
+    Ok(())
+}
+
 fn spawn_child_process(child_id: usize) -> io::Result<()> {
     // Open memory-mapped config file
     let file = OpenOptions::new()
@@ -149,12 +178,12 @@ fn spawn_child_process(child_id: usize) -> io::Result<()> {
         .write(true)
         .create(true)
         .open(CONFIG_FILE)?;
-    file.set_len(16)?; // Ensure file is large enough
+    file.set_len(16)?;
 
     let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
 
     let mut last_version = 0;
-    let mut sleep_time = (child_id + 1) * 5; // 5, 10, 15, 20 seconds
+    let mut sleep_time = (child_id + 1) * 5;
 
     println!("Child {} started with initial sleep time: {} seconds", child_id, sleep_time);
     
@@ -177,15 +206,9 @@ fn spawn_child_process(child_id: usize) -> io::Result<()> {
     }
 }
 
-fn run_server() -> io::Result<()> {
-    let mut counter = 0;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(LOG_FILE)?;
-
-    file.lock_exclusive()?;
-    println!("Server started. Press Ctrl+C to stop.");
+fn run_server(port: u16) -> io::Result<()> {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
+    println!("Server listening on port {}", port);
 
     // Create memory-mapped config file
     let config_file = OpenOptions::new()
@@ -193,7 +216,7 @@ fn run_server() -> io::Result<()> {
         .write(true)
         .create(true)
         .open(CONFIG_FILE)?;
-    config_file.set_len(16)?; // Ensure file is large enough
+    config_file.set_len(16)?;
 
     let mut mmap = unsafe { MmapOptions::new().map_mut(&config_file)? };
 
@@ -225,7 +248,36 @@ fn run_server() -> io::Result<()> {
     }
 
     // Main server loop
-    loop {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                // Read current config for this connection
+                let mut config_bytes = [0u8; 16];
+                config_bytes.copy_from_slice(&mmap[..16]);
+                let config = Config::from_bytes(&config_bytes);
+
+                // Fork a new process to handle the connection
+                match unsafe { fork() } {
+                    Ok(ForkResult::Parent { child, .. }) => {
+                        println!("Forked connection handler with PID: {}", child);
+                        children.push(child);
+                    }
+                    Ok(ForkResult::Child) => {
+                        if let Err(e) = handle_connection(stream, &config) {
+                            eprintln!("Error handling connection: {}", e);
+                        }
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("Fork failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to accept connection: {}", e);
+            }
+        }
+
         // Check for completed child processes
         let mut completed_children = Vec::new();
         for &child_pid in &children {
@@ -244,17 +296,6 @@ fn run_server() -> io::Result<()> {
 
         // Remove completed children
         children.retain(|&p| !completed_children.contains(&p));
-
-        // Continue with logging
-        counter += 1;
-        append_log(&mut file, &format!("Log entry #{}", counter))?;
-        thread::sleep(Duration::from_secs(1));
-
-        // Exit if all children have finished
-        if children.is_empty() {
-            println!("All child processes have completed");
-            break;
-        }
     }
 
     Ok(())
@@ -290,8 +331,8 @@ fn main() -> io::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run => {
-            run_server()?;
+        Commands::Run { port } => {
+            run_server(port)?;
         }
         Commands::Count => {
             count_logs()?;
