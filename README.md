@@ -4,12 +4,11 @@ A command-line utility for logging messages, counting log entries, and managing 
 
 ## Features
 
-- TCP server with process-based concurrency
+- TCP server with thread-based concurrency
 - Continuous logging with timestamps
 - Log file rotation
 - File locking for concurrent access
 - Log entry counting
-- Process forking and child process management
 - Live configuration updates using memory-mapped files
 
 ## Usage
@@ -25,11 +24,11 @@ The program provides four commands:
 
 To start the web server:
 ```bash
-# Start server on default port (8080)
+# Start server on default port (8080) with default threads (4)
 cargo run -- run
 
-# Start server on specific port
-cargo run -- run --port 3000
+# Start server on specific port with custom number of threads
+cargo run -- run --port 3000 --threads 8
 ```
 
 To count log entries:
@@ -93,23 +92,23 @@ When rotating logs:
 2. Each log file is renamed to the next number (e.g., `http.1.log` → `http.2.log`)
 3. `http.log` is renamed to `http.1.log`
 
-## Process Management
+## Thread Management
 
 When running the server:
-- Forks 4 child processes for background tasks
-- Forks a new process for each incoming TCP connection
-- Parent process monitors all child processes
-- Child process status is reported as they complete
+- Creates a fixed-size thread pool at startup
+- Each incoming connection is handled by a worker thread from the pool
+- Threads share configuration through atomic reference counting
+- Default thread pool size is 4, but can be configured at startup
 
 ## Configuration Management
 
-The server uses memory-mapped files to share configuration between processes. Configuration parameters include:
+The server uses memory-mapped files to share configuration between threads. Configuration parameters include:
 
 - `verbosity`: Log verbosity level (0-3)
 - `max_connections`: Maximum number of concurrent connections
 - `timeout_seconds`: Connection timeout in seconds
 
-Configuration changes are detected by child processes in real-time, and they adjust their behavior accordingly. The configuration is stored in `config.dat` and is shared between all processes.
+Configuration changes are detected by worker threads in real-time, and they adjust their behavior accordingly. The configuration is stored in `config.dat` and is shared between all threads.
 
 ### Default Configuration
 

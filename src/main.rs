@@ -6,20 +6,18 @@ use std::time::Duration;
 use chrono::Local;
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
-use nix::unistd::{fork, ForkResult};
-use nix::sys::wait::{waitpid, WaitStatus};
-use std::process::Command;
 use memmap2::{MmapMut, MmapOptions};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::net::{TcpListener, TcpStream};
 use std::str;
+use threadpool::ThreadPool;
 
 const LOG_FILE: &str = "http.log";
 const MAX_LOG_FILES: u32 = 5;
-const NUM_CHILDREN: usize = 4;
 const CONFIG_FILE: &str = "config.dat";
 const DEFAULT_PORT: u16 = 8080;
+const NUM_THREADS: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 struct Config {
@@ -72,6 +70,9 @@ enum Commands {
         /// Port to listen on
         #[arg(short, long, default_value_t = DEFAULT_PORT)]
         port: u16,
+        /// Number of worker threads
+        #[arg(short, long, default_value_t = NUM_THREADS)]
+        threads: usize,
     },
     /// Count the number of log entries
     Count,
@@ -149,7 +150,7 @@ fn update_config(config: &mut Config, verbosity: Option<u32>, max_connections: O
     config.version += 1;
 }
 
-fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
+fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> io::Result<()> {
     let mut buffer = [0; 1024];
     let bytes_read = stream.read(&mut buffer)?;
     
@@ -171,44 +172,9 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
     Ok(())
 }
 
-fn spawn_child_process(child_id: usize) -> io::Result<()> {
-    // Open memory-mapped config file
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(CONFIG_FILE)?;
-    file.set_len(16)?;
-
-    let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
-
-    let mut last_version = 0;
-    let mut sleep_time = (child_id + 1) * 5;
-
-    println!("Child {} started with initial sleep time: {} seconds", child_id, sleep_time);
-    
-    loop {
-        // Read current config
-        let mut config_bytes = [0u8; 16];
-        config_bytes.copy_from_slice(&mmap[..16]);
-        let config = Config::from_bytes(&config_bytes);
-
-        // Check for config updates
-        if config.version != last_version {
-            println!("Child {} detected config update: {:?}", child_id, config);
-            last_version = config.version;
-            sleep_time = (child_id + 1) * 5 * (config.verbosity as usize + 1);
-        }
-
-        // Sleep for the configured duration
-        thread::sleep(Duration::from_secs(sleep_time as u64));
-        println!("Child {} woke up after {} seconds", child_id, sleep_time);
-    }
-}
-
-fn run_server(port: u16) -> io::Result<()> {
+fn run_server(port: u16, num_threads: usize) -> io::Result<()> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
-    println!("Server listening on port {}", port);
+    println!("Server listening on port {} with {} worker threads", port, num_threads);
 
     // Create memory-mapped config file
     let config_file = OpenOptions::new()
@@ -221,31 +187,12 @@ fn run_server(port: u16) -> io::Result<()> {
     let mut mmap = unsafe { MmapOptions::new().map_mut(&config_file)? };
 
     // Initialize config
-    let config = Config::new();
+    let config = Arc::new(Config::new());
     mmap[..16].copy_from_slice(&config.to_bytes());
 
-    // Fork child processes
-    let mut children = Vec::new();
-    for i in 0..NUM_CHILDREN {
-        match unsafe { fork() } {
-            Ok(ForkResult::Parent { child, .. }) => {
-                println!("Forked child process with PID: {}", child);
-                children.push(child);
-            }
-            Ok(ForkResult::Child) => {
-                // Child process
-                if let Err(e) = spawn_child_process(i) {
-                    eprintln!("Child {} error: {}", i, e);
-                    std::process::exit(1);
-                }
-                std::process::exit(0);
-            }
-            Err(e) => {
-                eprintln!("Fork failed: {}", e);
-                return Err(io::Error::new(io::ErrorKind::Other, "Fork failed"));
-            }
-        }
-    }
+    // Create thread pool
+    let pool = ThreadPool::new(num_threads);
+    println!("Created thread pool with {} workers", num_threads);
 
     // Main server loop
     for stream in listener.incoming() {
@@ -254,48 +201,23 @@ fn run_server(port: u16) -> io::Result<()> {
                 // Read current config for this connection
                 let mut config_bytes = [0u8; 16];
                 config_bytes.copy_from_slice(&mmap[..16]);
-                let config = Config::from_bytes(&config_bytes);
+                let current_config = Config::from_bytes(&config_bytes);
+                let config = Arc::new(current_config);
 
-                // Fork a new process to handle the connection
-                match unsafe { fork() } {
-                    Ok(ForkResult::Parent { child, .. }) => {
-                        println!("Forked connection handler with PID: {}", child);
-                        children.push(child);
+                // Clone the Arc for the thread
+                let config_clone = Arc::clone(&config);
+                
+                // Spawn a new thread to handle the connection
+                pool.execute(move || {
+                    if let Err(e) = handle_connection(stream, config_clone) {
+                        eprintln!("Error handling connection: {}", e);
                     }
-                    Ok(ForkResult::Child) => {
-                        if let Err(e) = handle_connection(stream, &config) {
-                            eprintln!("Error handling connection: {}", e);
-                        }
-                        std::process::exit(0);
-                    }
-                    Err(e) => {
-                        eprintln!("Fork failed: {}", e);
-                    }
-                }
+                });
             }
             Err(e) => {
                 eprintln!("Failed to accept connection: {}", e);
             }
         }
-
-        // Check for completed child processes
-        let mut completed_children = Vec::new();
-        for &child_pid in &children {
-            match waitpid(child_pid, None) {
-                Ok(WaitStatus::Exited(pid, status)) => {
-                    println!("Child {} exited with status {}", pid, status);
-                    completed_children.push(pid);
-                }
-                Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                    println!("Child {} terminated by signal {:?}", pid, signal);
-                    completed_children.push(pid);
-                }
-                _ => {}
-            }
-        }
-
-        // Remove completed children
-        children.retain(|&p| !completed_children.contains(&p));
     }
 
     Ok(())
@@ -331,8 +253,8 @@ fn main() -> io::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { port } => {
-            run_server(port)?;
+        Commands::Run { port, threads } => {
+            run_server(port, threads)?;
         }
         Commands::Count => {
             count_logs()?;
